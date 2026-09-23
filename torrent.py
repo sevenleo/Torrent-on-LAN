@@ -4,6 +4,8 @@ import socket
 import subprocess
 import shutil
 import threading
+import hashlib
+import time
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 from http.server import HTTPServer, BaseHTTPRequestHandler, SimpleHTTPRequestHandler
@@ -207,43 +209,158 @@ def firewall_snippet():
     )
 
 def build_client_cmd(local_ip, location=""):
-    """Single-block client one-liner. UAC fires only if firewall rules lack."""
-    if location:
-        loc = "New-Item -ItemType Directory -Force " + location + " | Out-Null; Set-Location " + location + "; "
+    """Single-block client one-liner. UAC fires only if firewall rules lack.
+
+    Robustness fixes:
+    - bare drive 'D:' / 'd:' normalized to 'D:\\' (New-Item rejects 'D:').
+    - kills stale aria2c + removes locked exe/torrent before re-download,
+      so re-running the command resumes instead of 'file in use'.
+    - --dht-file-path=dht.dat keeps DHT cache local (avoids the
+      'Failed to load DHT routing table from .../.cache/aria2/dht.dat'
+      noise on first run).
+    Uses single quotes only (no inner double quotes) so the one-liner
+    pastes identically in cmd.exe and PowerShell.
+    """
+    import re
+    loc_norm = location.strip().strip('"').strip("'").strip() if location else ""
+    if re.match(r"^[A-Za-z]$", loc_norm):
+        loc_norm = loc_norm + ":\\"
+    elif re.match(r"^[A-Za-z]:$", loc_norm):
+        loc_norm = loc_norm + "\\"
+    if loc_norm:
+        q = loc_norm.replace("'", "''")
+        loc = (f"$dl='{q}'; if($dl -match '^[A-Za-z]:$'){{$dl=$dl+'\\'}}; "
+               "if($dl -notmatch '^[A-Za-z]:\\\\$'){New-Item -ItemType Directory -Force $dl | Out-Null}; "
+               "Set-Location $dl; ")
     else:
         loc = ""
+    # Stop a previous run first: otherwise aria2c.exe is locked and the
+    # re-download fails with 'being used by another process'. .aria2
+    # control + partial ISO are kept, so aria2 resumes. Wait up to ~5s:
+    # killing during checksum of a large file takes longer than 800ms.
+    pre = ("Get-Process aria2c -ErrorAction SilentlyContinue | "
+           "Stop-Process -Force -ErrorAction SilentlyContinue; "
+           "for($i=0;$i -lt 10 -and (Get-Process aria2c -ErrorAction SilentlyContinue);$i++){Start-Sleep -Milliseconds 500}; "
+           "Remove-Item aria2c.exe -Force -ErrorAction SilentlyContinue; "
+           "Remove-Item dist.torrent -Force -ErrorAction SilentlyContinue; ")
     inner = (
-        firewall_snippet() + "; " + loc +
+        firewall_snippet() + "; " + loc + pre +
         "Invoke-WebRequest http://" + local_ip + ":" + str(HTTP_PORT) + "/aria2c.exe -OutFile aria2c.exe; " +
         "Invoke-WebRequest http://" + local_ip + ":" + str(HTTP_PORT) + "/dist.torrent -OutFile dist.torrent; " +
         ".\\aria2c.exe --enable-dht=true --bt-enable-lpd=true --listen-port=" + str(ARIA_PEER_PORT) + " " +
-        "--seed-ratio=0.0 --summary-interval=10 dist.torrent"
+        "--dht-file-path=dht.dat --check-integrity=true --seed-ratio=0.0 --summary-interval=10 dist.torrent"
     )
     assert '"' not in inner, "inner command must not contain double quotes"
     return 'powershell -Command "' + inner + '"'
 
+def create_torrent(target_path, torrent_file, announce_url, piece_length):
+    """Pure-Python .torrent creator (replaces mktorrent.exe).
+
+    The bundled mktorrent 1.0 mingw build uses signed 32-bit sizes
+    ('-1429667840 bytes') and heap-corrupts (0xC0000374) on files >2 GiB.
+    This implementation handles arbitrary sizes and follows BEP-3:
+    pieces = SHA1 of the concatenated file bytes.
+    """
+    piece_length = int(piece_length)
+    total_size = 0
+    files = []  # [(absolute_path, rel_parts, length)]
+
+    if os.path.isfile(target_path):
+        total_size = os.path.getsize(target_path)
+        files = [(target_path, None, total_size)]
+        torrent_name = os.path.basename(os.path.abspath(target_path))
+    else:
+        torrent_name = os.path.basename(os.path.abspath(target_path))
+        for root, dirs, filenames in os.walk(target_path):
+            dirs.sort()
+            filenames.sort()
+            for fn in filenames:
+                abs_p = os.path.join(root, fn)
+                if not os.path.isfile(abs_p):
+                    continue
+                rel = os.path.relpath(abs_p, target_path)
+                parts = rel.split(os.sep)
+                length = os.path.getsize(abs_p)
+                files.append((abs_p, parts, length))
+                total_size += length
+        if not files:
+            print(f"Error: folder '{target_path}' contains no files.")
+            sys.exit(1)
+
+    num_pieces = (total_size + piece_length - 1) // piece_length if total_size else 0
+    print(f"Total size: {total_size} bytes in {len(files)} file(s).")
+    print(f"That's {num_pieces} pieces of {piece_length} bytes each.")
+
+    pieces_hash = bytearray()
+    buf = bytearray()
+    done_pieces = 0
+
+    def flush_piece():
+        nonlocal done_pieces
+        pieces_hash.extend(hashlib.sha1(bytes(buf)).digest())
+        buf.clear()
+        done_pieces += 1
+        if done_pieces % 25 == 0 or done_pieces == num_pieces:
+            print(f"  Hashed piece {done_pieces}/{num_pieces}...")
+
+    for abs_p, _rel_parts, _length in files:
+        with open(abs_p, "rb") as f:
+            while True:
+                chunk = f.read(1 << 20)  # 1 MiB reads, low memory
+                if not chunk:
+                    break
+                mv = memoryview(chunk)
+                while len(mv) > 0:
+                    need = piece_length - len(buf)
+                    take = mv[:need]
+                    buf.extend(take)
+                    mv = mv[len(take):]
+                    if len(buf) == piece_length:
+                        flush_piece()
+    if len(buf) > 0 or total_size == 0:
+        flush_piece()
+
+    if os.path.isfile(target_path):
+        info = {
+            b"name": torrent_name.encode("utf-8"),
+            b"piece length": piece_length,
+            b"pieces": bytes(pieces_hash),
+            b"length": total_size,
+        }
+    else:
+        file_list = []
+        for _abs_p, parts, length in files:
+            file_list.append({
+                b"length": length,
+                b"path": [p.encode("utf-8") for p in parts],
+            })
+        info = {
+            b"name": torrent_name.encode("utf-8"),
+            b"piece length": piece_length,
+            b"pieces": bytes(pieces_hash),
+            b"files": file_list,
+        }
+
+    torrent_dict = {
+        b"announce": announce_url.encode("utf-8"),
+        b"creation date": int(time.time()),
+        b"created by": b"LANDist (pure-python)",
+        b"info": info,
+    }
+    with open(torrent_file, "wb") as out:
+        out.write(bencode(torrent_dict))
+    print(f"Wrote {torrent_file} ({os.path.getsize(torrent_file)} bytes).")
+
+
 def ensure_mktorrent():
-    """Download mktorrent.exe next to this script on first run; reuse after."""
+    """Kept for backward compat; no longer required (pure-Python used)."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     exe_path = os.path.join(script_dir, "mktorrent.exe")
     if os.path.exists(exe_path) and os.path.getsize(exe_path) > 100_000:
         return exe_path
-
-    print("Downloading mktorrent.exe (one-time, ~165 KB)...")
-    try:
-        urllib.request.urlretrieve(MKTORRENT_URL, exe_path)
-    except Exception as e:
-        print(f"Error downloading mktorrent: {e}")
-        sys.exit(1)
-
-    if not os.path.exists(exe_path) or os.path.getsize(exe_path) < 100_000:
-        print("Error: mktorrent download is incomplete or invalid.")
-        sys.exit(1)
-    return exe_path
+    return None
 
 def ensure_dependencies():
-    mktorrent_path = ensure_mktorrent()
-
     aria2_path = shutil.which("aria2c")
     if not aria2_path:
         print("'aria2c' not found. Installing via winget...")
@@ -278,7 +395,7 @@ def ensure_dependencies():
         print("Error: 'aria2c' installation finished, but executable is not in PATH. Restart the terminal and retry.")
         sys.exit(1)
 
-    return aria2_path, mktorrent_path
+    return aria2_path
 
 def select_local_ip():
     hostname = socket.gethostname()
@@ -339,7 +456,7 @@ button{padding:8px 14px;margin:4px 4px 4px 0;cursor:pointer}
 </ol>
 <div class="files">Arquivos: <a href="/aria2c.exe" download>aria2c.exe</a> &middot; <a href="/dist.torrent" download>dist.torrent</a></div>
 <label for="dlpath"><b>Pasta de destino no cliente:</b></label>
-<input id="dlpath" placeholder="ex.: C:\Temp\landist (vazio = pasta atual)">
+<input id="dlpath" placeholder="ex.: D:\landist ou C:\Temp\landist (vazio = pasta atual; use D:\ e nao d:)">
 <div>
 <button data-expr="([Environment]::GetFolderPath('Desktop')+'\landist')">&Aacute;rea de Trabalho</button>
 <button data-expr="([Environment]::GetFolderPath('MyDocuments')+'\landist')">Documentos</button>
@@ -351,12 +468,16 @@ button{padding:8px 14px;margin:4px 4px 4px 0;cursor:pointer}
 const SRV='__SRV__', HTTPPORT='__HTTPPORT__', PEER='__PEER__';
 const FW='__FWJS__';
 function tail(){
-  return 'Invoke-WebRequest http://'+SRV+':'+HTTPPORT+'/aria2c.exe -OutFile aria2c.exe; '+
+  return 'Get-Process aria2c -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; '+
+    'for($i=0;$i -lt 10 -and (Get-Process aria2c -ErrorAction SilentlyContinue);$i++){Start-Sleep -Milliseconds 500}; '+
+    'Remove-Item aria2c.exe -Force -ErrorAction SilentlyContinue; '+
+    'Remove-Item dist.torrent -Force -ErrorAction SilentlyContinue; '+
+    'Invoke-WebRequest http://'+SRV+':'+HTTPPORT+'/aria2c.exe -OutFile aria2c.exe; '+
     'Invoke-WebRequest http://'+SRV+':'+HTTPPORT+'/dist.torrent -OutFile dist.torrent; '+
-    '.\\aria2c.exe --enable-dht=true --bt-enable-lpd=true --listen-port='+PEER+' --seed-ratio=0.0 --summary-interval=10 dist.torrent';
+    '.\\aria2c.exe --enable-dht=true --bt-enable-lpd=true --listen-port='+PEER+' --dht-file-path=dht.dat --check-integrity=true --seed-ratio=0.0 --summary-interval=10 dist.torrent';
 }
 function buildCmd(pathExpr){
-  const loc = pathExpr ? 'New-Item -ItemType Directory -Force '+pathExpr+' | Out-Null; Set-Location '+pathExpr+'; ' : '';
+  const loc = pathExpr ? '$dl='+pathExpr+'; if($dl -match \'^[A-Za-z]:$\'){$dl=$dl+\'\\\'}; if($dl -notmatch \'^[A-Za-z]:\\\\$\'){New-Item -ItemType Directory -Force $dl | Out-Null}; Set-Location $dl; ' : '';
   return 'powershell -Command "'+FW+'; '+loc+tail()+'"';
 }
 function currentExpr(){
@@ -459,7 +580,7 @@ def main():
     web_port = pick_free_port(WEB_PORT_PREFERRED)
     ensure_firewall([(f"LANDist Web", web_port, "TCP")])
     check_ports_free([("client web page", web_port)])
-    aria2_path, mktorrent_path = ensure_dependencies()
+    aria2_path = ensure_dependencies()
 
     target_path = input("Enter the file or folder path to distribute: ").strip().strip('"').strip("'")
     
@@ -481,19 +602,16 @@ def main():
     announce_url = f"http://{local_ip}:{TRACKER_PORT}/announce"
 
     print("\n[1/4] Generating .torrent file (8 MB piece size)...")
-    # NOTE: mktorrent 1.0 (mingw) mangles absolute Windows -o paths
-    # ("C:\cwd\C:\abs\..."), so run with cwd=staging_dir + bare filename.
-    mktorrent_cmd = [
-        mktorrent_path,
-        "-a", announce_url,
-        "-l", str(MKTORRENT_PIECE_EXP),
-        "-o", os.path.basename(torrent_file),
-        "-v",
-        target_path,
-    ]
-    subprocess.run(mktorrent_cmd, check=True, cwd=staging_dir)
+    try:
+        create_torrent(target_path, torrent_file,
+                       announce_url, 1 << MKTORRENT_PIECE_EXP)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"Error creating .torrent: {e}")
+        sys.exit(1)
     if not os.path.exists(torrent_file):
-        print(f"Error: mktorrent did not create '{torrent_file}'.")
+        print(f"Error: did not create '{torrent_file}'.")
         sys.exit(1)
 
     print(f"[2/4] Starting embedded BitTorrent tracker on port :{TRACKER_PORT}...")
